@@ -1,4 +1,4 @@
-# Research Report: Kernel Bypass and User-Space Packet Processing with eBPF/XDP and AF_XDP
+# Kernel Bypass and User-Space Packet Processing with eBPF/XDP and AF_XDP
 
 ## Abstract
 This report presents a proof-of-concept pipeline for high-performance packet processing using eBPF/XDP and AF_XDP on Linux. The pipeline demonstrates how packets can bypass the kernel networking stack, be redirected to user space for custom processing, and then be forwarded back to the kernel for normal handling. The setup uses a veth pair to simulate NICs, making it reproducible on commodity hardware or virtual machines.
