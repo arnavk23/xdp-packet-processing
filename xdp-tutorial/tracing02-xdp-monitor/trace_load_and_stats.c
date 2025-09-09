@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-static const char *__doc__ = "XDP loader and stats program\n"
-	" - Allows selecting BPF section --progname name to XDP-attach to --dev\n";
+static const char *__doc__ = "XDP monitor via tracepoints\n";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +10,8 @@ static const char *__doc__ = "XDP loader and stats program\n"
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
 
 #include <locale.h>
 #include <unistd.h>
@@ -23,6 +24,8 @@ static const char *__doc__ = "XDP loader and stats program\n"
 #include <linux/if_link.h> /* depend on kernel-headers installed */
 
 #include "../common/common_params.h"
+#include "../common/common_user_bpf_xdp.h"
+#include "../common/common_libbpf.h"
 
 #include <linux/perf_event.h>
 #define _GNU_SOURCE         /* See feature_test_macros(7) */
@@ -30,9 +33,64 @@ static const char *__doc__ = "XDP loader and stats program\n"
 #include <sys/syscall.h>   /* For SYS_xxx definitions */
 #include <sys/ioctl.h>
 
-#ifndef PATH_MAX
-#define PATH_MAX	4096
+enum {
+	REDIR_SUCCESS = 0,
+	REDIR_ERROR = 1,
+};
+
+#define XDP_UNKNOWN	XDP_REDIRECT + 1
+#ifndef XDP_ACTION_MAX
+#define XDP_ACTION_MAX (XDP_UNKNOWN + 1)
 #endif
+
+#define REDIR_RES_MAX 2
+static const char *redir_names[REDIR_RES_MAX] = {
+	[REDIR_SUCCESS]	= "Success",
+	[REDIR_ERROR]	= "Error",
+};
+
+static const char *err2str(int err)
+{
+	if (err < REDIR_RES_MAX)
+		return redir_names[err];
+	return NULL;
+}
+
+/* Common stats data record shared with _kern.c */
+struct datarec {
+	__u64 processed;
+	__u64 dropped;
+	__u64 info;
+	__u64 err;
+};
+
+#define MAX_CPUS 64
+
+/* Userspace structs for collection of stats from maps */
+struct record {
+	__u64 timestamp;
+	struct datarec total;
+	struct datarec *cpu;
+};
+
+struct u64rec {
+	__u64 processed;
+};
+
+struct record_u64 {
+	/* record for _kern side __u64 values */
+	__u64 timestamp;
+	struct u64rec total;
+	struct u64rec *cpu;
+};
+
+struct stats_record {
+	struct record_u64 xdp_redirect[REDIR_RES_MAX];
+	struct record_u64 xdp_exception[XDP_ACTION_MAX];
+	struct record xdp_cpumap_kthread;
+	struct record xdp_cpumap_enqueue[MAX_CPUS];
+	struct record xdp_devmap_xmit;
+};
 
 static const char *default_filename = "trace_prog_kern.o";
 
@@ -56,7 +114,7 @@ int find_map_fd(struct bpf_object *bpf_obj, const char *mapname)
 
 	/* Lesson#3: bpf_object to bpf_map */
 	map = bpf_object__find_map_by_name(bpf_obj, mapname);
-	if (!map) {
+        if (!map) {
 		fprintf(stderr, "ERR: cannot find map by name: %s\n", mapname);
 		goto out;
 	}
@@ -66,59 +124,6 @@ int find_map_fd(struct bpf_object *bpf_obj, const char *mapname)
 	return map_fd;
 }
 
-static void stats_print(int map_fd)
-{
-	/* For percpu maps, userspace gets a value per possible CPU */
-	unsigned int nr_cpus = libbpf_num_possible_cpus();
-	__u64 values[nr_cpus];
-	__s32 key;
-	void *keyp = &key, *prev_keyp = NULL;
-	int err;
-
-	while (true) {
-		char dev[IF_NAMESIZE];
-		__u64 total = 0;
-		int i;
-
-		err = bpf_map_get_next_key(map_fd, prev_keyp, keyp);
-		if (err) {
-			if (errno == ENOENT)
-				err = 0;
-			break;
-		}
-
-		if ((bpf_map_lookup_elem(map_fd, keyp, values)) != 0) {
-			fprintf(stderr,
-				"ERR: bpf_map_lookup_elem failed key:0x%X\n", key);
-			continue;
-		}
-
-		/* Sum values from each CPU */
-		for (i = 0; i < nr_cpus; i++)
-			total += values[i];
-
-		printf("%s (%llu) ", if_indextoname(key, dev), total);
-		prev_keyp = keyp;
-	}
-
-	printf("\n");
-}
-
-static void stats_poll(int map_fd, __u32 map_type, int interval)
-{
-	/* Trick to pretty printf with thousands separators use %' */
-	setlocale(LC_NUMERIC, "en_US");
-
-	while (1) {
-		stats_print(map_fd);
-		sleep(interval);
-	}
-}
-
-/* Lesson#4: It is userspace responsibility to known what map it is reading and
- * know the value size. Here get bpf_map_info and check if it match our expected
- * values.
- */
 static int __check_map_fd_info(int map_fd, struct bpf_map_info *info,
 			       struct bpf_map_info *exp)
 {
@@ -164,6 +169,592 @@ static int __check_map_fd_info(int map_fd, struct bpf_map_info *info,
 	return 0;
 }
 
+static int __check_map(int map_fd, struct bpf_map_info *exp)
+{
+	struct bpf_map_info info;
+
+	return __check_map_fd_info(map_fd, &info, exp);
+}
+
+static int check_map(const char *name, int fd)
+{
+	struct {
+		const char          *name;
+		struct bpf_map_info  info;
+	} maps[] = {
+		{
+			.name = "redirect_err_cnt",
+			.info = {
+				.type = BPF_MAP_TYPE_PERCPU_ARRAY,
+				.key_size = sizeof(__u32),
+				.value_size = sizeof(__u64),
+				.max_entries = 2,
+			}
+		},
+		{
+			.name = "exception_cnt",
+			.info = {
+				.type = BPF_MAP_TYPE_PERCPU_ARRAY,
+				.key_size = sizeof(__u32),
+				.value_size = sizeof(__u64),
+				.max_entries = XDP_UNKNOWN + 1,
+			}
+		},
+		{
+			.name = "cpumap_enqueue_cnt",
+			.info = {
+				.type = BPF_MAP_TYPE_PERCPU_ARRAY,
+				.key_size = sizeof(__u32),
+				.value_size = sizeof(struct datarec),
+				.max_entries = MAX_CPUS,
+			}
+		},
+		{
+			.name = "cpumap_kthread_cnt",
+			.info = {
+				.type = BPF_MAP_TYPE_PERCPU_ARRAY,
+				.key_size = sizeof(__u32),
+				.value_size = sizeof(struct datarec),
+				.max_entries = 1,
+			}
+		},
+		{
+			.name = "devmap_xmit_cnt",
+			.info = {
+				.type = BPF_MAP_TYPE_PERCPU_ARRAY,
+				.key_size = sizeof(__u32),
+				.value_size = sizeof(struct datarec),
+				.max_entries = 1,
+			}
+		},
+		{ }
+	};
+	int i = 0;
+
+	fprintf(stdout, "checking map %s\n", name);
+
+	while (maps[i].name) {
+		if (!strcmp(maps[i].name, name))
+			return __check_map(fd, &maps[i].info);
+		i++;
+	}
+
+	fprintf(stdout, "ERR: map %s not found\n", name);
+	return -1;
+}
+
+static int check_maps(struct bpf_object *obj)
+{
+	struct bpf_map *map;
+
+	bpf_object__for_each_map(map, obj) {
+		const char *name;
+		int fd;
+
+		name = bpf_map__name(map);
+		fd   = bpf_map__fd(map);
+
+		if (check_map(name, fd))
+			return -1;
+	}
+
+	return 0;
+}
+
+#define NANOSEC_PER_SEC 1000000000 /* 10^9 */
+static __u64 gettime(void)
+{
+	struct timespec t;
+	int res;
+
+	res = clock_gettime(CLOCK_MONOTONIC, &t);
+	if (res < 0) {
+		fprintf(stderr, "Error with clock_gettime! (%i)\n", res);
+		exit(-1);
+	}
+	return (__u64) t.tv_sec * NANOSEC_PER_SEC + t.tv_nsec;
+}
+
+static bool map_collect_record(int fd, __u32 key, struct record *rec)
+{
+	/* For percpu maps, userspace gets a value per possible CPU */
+	unsigned int nr_cpus = libbpf_num_possible_cpus();
+	struct datarec values[nr_cpus];
+	__u64 sum_processed = 0;
+	__u64 sum_dropped = 0;
+	__u64 sum_info = 0;
+	__u64 sum_err = 0;
+	int i;
+
+	if ((bpf_map_lookup_elem(fd, &key, values)) != 0) {
+		fprintf(stderr,
+			"ERR: bpf_map_lookup_elem failed key:0x%X\n", key);
+		return false;
+	}
+	/* Get time as close as possible to reading map contents */
+	rec->timestamp = gettime();
+
+	/* Record and sum values from each CPU */
+	for (i = 0; i < nr_cpus; i++) {
+		rec->cpu[i].processed = values[i].processed;
+		sum_processed        += values[i].processed;
+		rec->cpu[i].dropped = values[i].dropped;
+		sum_dropped        += values[i].dropped;
+		rec->cpu[i].info = values[i].info;
+		sum_info        += values[i].info;
+		rec->cpu[i].err = values[i].err;
+		sum_err        += values[i].err;
+	}
+	rec->total.processed = sum_processed;
+	rec->total.dropped   = sum_dropped;
+	rec->total.info      = sum_info;
+	rec->total.err       = sum_err;
+	return true;
+}
+
+static bool map_collect_record_u64(int fd, __u32 key, struct record_u64 *rec)
+{
+	/* For percpu maps, userspace gets a value per possible CPU */
+	unsigned int nr_cpus = libbpf_num_possible_cpus();
+	struct u64rec values[nr_cpus];
+	__u64 sum_total = 0;
+	int i;
+
+	if ((bpf_map_lookup_elem(fd, &key, values)) != 0) {
+		fprintf(stderr,
+			"ERR: bpf_map_lookup_elem failed key:0x%X\n", key);
+		return false;
+	}
+	/* Get time as close as possible to reading map contents */
+	rec->timestamp = gettime();
+
+	/* Record and sum values from each CPU */
+	for (i = 0; i < nr_cpus; i++) {
+		rec->cpu[i].processed = values[i].processed;
+		sum_total            += values[i].processed;
+	}
+	rec->total.processed = sum_total;
+	return true;
+}
+
+static double calc_period(struct record *r, struct record *p)
+{
+	double period_ = 0;
+	__u64 period = 0;
+
+	period = r->timestamp - p->timestamp;
+	if (period > 0)
+		period_ = ((double) period / NANOSEC_PER_SEC);
+
+	return period_;
+}
+
+static double calc_period_u64(struct record_u64 *r, struct record_u64 *p)
+{
+	double period_ = 0;
+	__u64 period = 0;
+
+	period = r->timestamp - p->timestamp;
+	if (period > 0)
+		period_ = ((double) period / NANOSEC_PER_SEC);
+
+	return period_;
+}
+
+static double calc_pps(struct datarec *r, struct datarec *p, double period)
+{
+	__u64 packets = 0;
+	double pps = 0;
+
+	if (period > 0) {
+		packets = r->processed - p->processed;
+		pps = packets / period;
+	}
+	return pps;
+}
+
+static double calc_pps_u64(struct u64rec *r, struct u64rec *p, double period)
+{
+	__u64 packets = 0;
+	double pps = 0;
+
+	if (period > 0) {
+		packets = r->processed - p->processed;
+		pps = packets / period;
+	}
+	return pps;
+}
+
+static double calc_drop(struct datarec *r, struct datarec *p, double period)
+{
+	__u64 packets = 0;
+	double pps = 0;
+
+	if (period > 0) {
+		packets = r->dropped - p->dropped;
+		pps = packets / period;
+	}
+	return pps;
+}
+
+static double calc_info(struct datarec *r, struct datarec *p, double period)
+{
+	__u64 packets = 0;
+	double pps = 0;
+
+	if (period > 0) {
+		packets = r->info - p->info;
+		pps = packets / period;
+	}
+	return pps;
+}
+
+static double calc_err(struct datarec *r, struct datarec *p, double period)
+{
+	__u64 packets = 0;
+	double pps = 0;
+
+	if (period > 0) {
+		packets = r->err - p->err;
+		pps = packets / period;
+	}
+	return pps;
+}
+
+static void stats_print(struct stats_record *stats_rec,
+			struct stats_record *stats_prev,
+			bool err_only)
+{
+	unsigned int nr_cpus = libbpf_num_possible_cpus();
+	int rec_i = 0, i, to_cpu;
+	double t = 0, pps = 0;
+
+	/* Header */
+	printf("%-15s %-7s %-12s %-12s %-9s\n",
+	       "XDP-event", "CPU:to", "pps", "drop-pps", "extra-info");
+
+	/* tracepoint: xdp:xdp_redirect_* */
+	if (err_only)
+		rec_i = REDIR_ERROR;
+
+	for (; rec_i < REDIR_RES_MAX; rec_i++) {
+		struct record_u64 *rec, *prev;
+		char *fmt1 = "%-15s %-7d %'-12.0f %'-12.0f %s\n";
+		char *fmt2 = "%-15s %-7s %'-12.0f %'-12.0f %s\n";
+
+		rec  =  &stats_rec->xdp_redirect[rec_i];
+		prev = &stats_prev->xdp_redirect[rec_i];
+		t = calc_period_u64(rec, prev);
+
+		for (i = 0; i < nr_cpus; i++) {
+			struct u64rec *r = &rec->cpu[i];
+			struct u64rec *p = &prev->cpu[i];
+
+			pps = calc_pps_u64(r, p, t);
+			if (pps > 0)
+				printf(fmt1, "XDP_REDIRECT", i,
+				       rec_i ? 0.0: pps, rec_i ? pps : 0.0,
+				       err2str(rec_i));
+		}
+		pps = calc_pps_u64(&rec->total, &prev->total, t);
+		printf(fmt2, "XDP_REDIRECT", "total",
+		       rec_i ? 0.0: pps, rec_i ? pps : 0.0, err2str(rec_i));
+	}
+
+	/* tracepoint: xdp:xdp_exception */
+	for (rec_i = 0; rec_i < XDP_ACTION_MAX; rec_i++) {
+		struct record_u64 *rec, *prev;
+		char *fmt1 = "%-15s %-7d %'-12.0f %'-12.0f %s\n";
+		char *fmt2 = "%-15s %-7s %'-12.0f %'-12.0f %s\n";
+
+		rec  =  &stats_rec->xdp_exception[rec_i];
+		prev = &stats_prev->xdp_exception[rec_i];
+		t = calc_period_u64(rec, prev);
+
+		for (i = 0; i < nr_cpus; i++) {
+			struct u64rec *r = &rec->cpu[i];
+			struct u64rec *p = &prev->cpu[i];
+
+			pps = calc_pps_u64(r, p, t);
+			if (pps > 0)
+				printf(fmt1, "Exception", i,
+				       0.0, pps, action2str(rec_i));
+		}
+		pps = calc_pps_u64(&rec->total, &prev->total, t);
+		if (pps > 0)
+			printf(fmt2, "Exception", "total",
+			       0.0, pps, action2str(rec_i));
+	}
+
+	/* cpumap enqueue stats */
+	for (to_cpu = 0; to_cpu < MAX_CPUS; to_cpu++) {
+		char *fmt1 = "%-15s %3d:%-3d %'-12.0f %'-12.0f %'-10.2f %s\n";
+		char *fmt2 = "%-15s %3s:%-3d %'-12.0f %'-12.0f %'-10.2f %s\n";
+		struct record *rec, *prev;
+		char *info_str = "";
+		double drop, info;
+
+		rec  =  &stats_rec->xdp_cpumap_enqueue[to_cpu];
+		prev = &stats_prev->xdp_cpumap_enqueue[to_cpu];
+		t = calc_period(rec, prev);
+		for (i = 0; i < nr_cpus; i++) {
+			struct datarec *r = &rec->cpu[i];
+			struct datarec *p = &prev->cpu[i];
+
+			pps  = calc_pps(r, p, t);
+			drop = calc_drop(r, p, t);
+			info = calc_info(r, p, t);
+			if (info > 0) {
+				info_str = "bulk-average";
+				info = pps / info; /* calc average bulk size */
+			}
+			if (pps > 0)
+				printf(fmt1, "cpumap-enqueue",
+				       i, to_cpu, pps, drop, info, info_str);
+		}
+		pps = calc_pps(&rec->total, &prev->total, t);
+		if (pps > 0) {
+			drop = calc_drop(&rec->total, &prev->total, t);
+			info = calc_info(&rec->total, &prev->total, t);
+			if (info > 0) {
+				info_str = "bulk-average";
+				info = pps / info; /* calc average bulk size */
+			}
+			printf(fmt2, "cpumap-enqueue",
+			       "sum", to_cpu, pps, drop, info, info_str);
+		}
+	}
+
+	/* cpumap kthread stats */
+	{
+		char *fmt1 = "%-15s %-7d %'-12.0f %'-12.0f %'-10.0f %s\n";
+		char *fmt2 = "%-15s %-7s %'-12.0f %'-12.0f %'-10.0f %s\n";
+		struct record *rec, *prev;
+		double drop, info;
+		char *i_str = "";
+
+		rec  =  &stats_rec->xdp_cpumap_kthread;
+		prev = &stats_prev->xdp_cpumap_kthread;
+		t = calc_period(rec, prev);
+		for (i = 0; i < nr_cpus; i++) {
+			struct datarec *r = &rec->cpu[i];
+			struct datarec *p = &prev->cpu[i];
+
+			pps  = calc_pps(r, p, t);
+			drop = calc_drop(r, p, t);
+			info = calc_info(r, p, t);
+			if (info > 0)
+				i_str = "sched";
+			if (pps > 0 || drop > 0)
+				printf(fmt1, "cpumap-kthread",
+				       i, pps, drop, info, i_str);
+		}
+		pps = calc_pps(&rec->total, &prev->total, t);
+		drop = calc_drop(&rec->total, &prev->total, t);
+		info = calc_info(&rec->total, &prev->total, t);
+		if (info > 0)
+			i_str = "sched-sum";
+		printf(fmt2, "cpumap-kthread", "total", pps, drop, info, i_str);
+	}
+
+	/* devmap ndo_xdp_xmit stats */
+	{
+		char *fmt1 = "%-15s %-7d %'-12.0f %'-12.0f %'-10.2f %s %s\n";
+		char *fmt2 = "%-15s %-7s %'-12.0f %'-12.0f %'-10.2f %s %s\n";
+		struct record *rec, *prev;
+		double drop, info, err;
+		char *i_str = "";
+		char *err_str = "";
+
+		rec  =  &stats_rec->xdp_devmap_xmit;
+		prev = &stats_prev->xdp_devmap_xmit;
+		t = calc_period(rec, prev);
+		for (i = 0; i < nr_cpus; i++) {
+			struct datarec *r = &rec->cpu[i];
+			struct datarec *p = &prev->cpu[i];
+
+			pps  = calc_pps(r, p, t);
+			drop = calc_drop(r, p, t);
+			info = calc_info(r, p, t);
+			err  = calc_err(r, p, t);
+			if (info > 0) {
+				i_str = "bulk-average";
+				info = (pps+drop) / info; /* calc avg bulk */
+			}
+			if (err > 0)
+				err_str = "drv-err";
+			if (pps > 0 || drop > 0)
+				printf(fmt1, "devmap-xmit",
+				       i, pps, drop, info, i_str, err_str);
+		}
+		pps = calc_pps(&rec->total, &prev->total, t);
+		drop = calc_drop(&rec->total, &prev->total, t);
+		info = calc_info(&rec->total, &prev->total, t);
+		err  = calc_err(&rec->total, &prev->total, t);
+		if (info > 0) {
+			i_str = "bulk-average";
+			info = (pps+drop) / info; /* calc avg bulk */
+		}
+		if (err > 0)
+			err_str = "drv-err";
+		printf(fmt2, "devmap-xmit", "total", pps, drop,
+		       info, i_str, err_str);
+	}
+
+	printf("\n");
+}
+
+static int map_fd(struct bpf_object *obj, const char *name)
+{
+	struct bpf_map *map;
+
+	map = bpf_object__find_map_by_name(obj, name);
+	if (map)
+		return bpf_map__fd(map);
+
+	return -1;
+}
+
+static bool stats_collect(struct bpf_object *obj, struct stats_record *rec)
+{
+	int fd;
+	int i;
+
+	/* TODO: Detect if someone unloaded the perf event_fd's, as
+	 * this can happen by someone running perf-record -e
+	 */
+
+	fd = map_fd(obj, "redirect_err_cnt");
+
+	for (i = 0; i < REDIR_RES_MAX; i++)
+		map_collect_record_u64(fd, i, &rec->xdp_redirect[i]);
+
+	fd = map_fd(obj, "exception_cnt");
+
+	for (i = 0; i < XDP_ACTION_MAX; i++) {
+		map_collect_record_u64(fd, i, &rec->xdp_exception[i]);
+	}
+
+	fd = map_fd(obj, "cpumap_enqueue_cnt");
+
+	for (i = 0; i < MAX_CPUS; i++)
+		map_collect_record(fd, i, &rec->xdp_cpumap_enqueue[i]);
+
+	fd = map_fd(obj, "cpumap_kthread_cnt");
+
+	map_collect_record(fd, 0, &rec->xdp_cpumap_kthread);
+
+	fd = map_fd(obj, "devmap_xmit_cnt");
+
+	map_collect_record(fd, 0, &rec->xdp_devmap_xmit);
+
+	return true;
+}
+
+static void *alloc_rec_per_cpu(int record_size)
+{
+	unsigned int nr_cpus = libbpf_num_possible_cpus();
+	void *array;
+	size_t size;
+
+	size = record_size * nr_cpus;
+	array = malloc(size);
+	memset(array, 0, size);
+	if (!array) {
+		fprintf(stderr, "Mem alloc error (nr_cpus:%u)\n", nr_cpus);
+		exit(-1);
+	}
+	return array;
+}
+
+static struct stats_record *alloc_stats_record(void)
+{
+	struct stats_record *rec;
+	int rec_sz;
+	int i;
+
+	/* Alloc main stats_record structure */
+	rec = malloc(sizeof(*rec));
+	memset(rec, 0, sizeof(*rec));
+	if (!rec) {
+		fprintf(stderr, "Mem alloc error\n");
+		exit(-1);
+	}
+
+	/* Alloc stats stored per CPU for each record */
+	rec_sz = sizeof(struct u64rec);
+	for (i = 0; i < REDIR_RES_MAX; i++)
+		rec->xdp_redirect[i].cpu = alloc_rec_per_cpu(rec_sz);
+
+	for (i = 0; i < XDP_ACTION_MAX; i++)
+		rec->xdp_exception[i].cpu = alloc_rec_per_cpu(rec_sz);
+
+	rec_sz = sizeof(struct datarec);
+	rec->xdp_cpumap_kthread.cpu = alloc_rec_per_cpu(rec_sz);
+	rec->xdp_devmap_xmit.cpu    = alloc_rec_per_cpu(rec_sz);
+
+	for (i = 0; i < MAX_CPUS; i++)
+		rec->xdp_cpumap_enqueue[i].cpu = alloc_rec_per_cpu(rec_sz);
+
+	return rec;
+}
+
+static void free_stats_record(struct stats_record *r)
+{
+	int i;
+
+	for (i = 0; i < REDIR_RES_MAX; i++)
+		free(r->xdp_redirect[i].cpu);
+
+	for (i = 0; i < XDP_ACTION_MAX; i++)
+		free(r->xdp_exception[i].cpu);
+
+	free(r->xdp_cpumap_kthread.cpu);
+	free(r->xdp_devmap_xmit.cpu);
+
+	for (i = 0; i < MAX_CPUS; i++)
+		free(r->xdp_cpumap_enqueue[i].cpu);
+
+	free(r);
+}
+
+/* Pointer swap trick */
+static inline void swap(struct stats_record **a, struct stats_record **b)
+{
+	struct stats_record *tmp;
+
+	tmp = *a;
+	*a = *b;
+	*b = tmp;
+}
+
+static void stats_poll(struct bpf_object *obj, int interval, bool err_only)
+{
+	struct stats_record *rec, *prev;
+
+	rec  = alloc_stats_record();
+	prev = alloc_stats_record();
+	stats_collect(obj, rec);
+
+	if (err_only)
+		printf("\n%s\n", "???");
+
+	/* Trick to pretty printf with thousands separators use %' */
+	setlocale(LC_NUMERIC, "en_US");
+
+	while (1) {
+		swap(&prev, &rec);
+		stats_collect(obj, rec);
+		stats_print(rec, prev, err_only);
+		fflush(stdout);
+		sleep(interval);
+	}
+
+	free_stats_record(rec);
+	free_stats_record(prev);
+}
+
+
 int filename__read_int(const char *filename, int *value)
 {
 	char line[64];
@@ -184,40 +775,53 @@ int filename__read_int(const char *filename, int *value)
 static struct bpf_object* load_bpf_and_trace_attach(struct config *cfg)
 {
 	struct bpf_object *obj;
-	int err;
 	struct bpf_program *prog;
-	struct bpf_link *link;
+	struct bpf_link *tp_link;
+	int err;
 
 	obj = bpf_object__open_file(cfg->filename, NULL);
-	err = libbpf_get_error(obj);
-	if (err)
+	if (libbpf_get_error(obj)) {
+		fprintf(stderr, "ERR: opening BPF object file %s failed\n",
+			cfg->filename);
 		return NULL;
-
-	err = bpf_object__load(obj);
-	if (err) {
-			fprintf(stderr, "ERR: loading BPF-OBJ file(%s) (%d): %s\n",
-					cfg->filename, err, strerror(-err));
-			goto err;
 	}
 
-	prog = bpf_object__next_program(obj, NULL);
-	if (!prog) {
-			fprintf(stderr, "ERR: Failed to retrieve program from BPF-OBJ file(%s) (%d): %s\n",
-					cfg->filename, err, strerror(-err));
-			goto err;
-	}
-
-	link = bpf_program__attach_tracepoint(prog, "xdp", "xdp_exception");
-	if (libbpf_get_error(link)) {
-		printf("bpf_program__attach_tracepoint failed\n");
+	if (bpf_object__load(obj)) {
+		fprintf(stderr, "ERR: loading BPF object file %s failed\n",
+			cfg->filename);
 		goto err;
 	}
-	/*
-	 * As far as this program is concerned, we don't care about
-	 * the perf event file descriptor, it will get closed when
-	 * the program is terminated. But normally you want to call
-	 * close(fd) when you stop using it.
-	 */
+
+	bpf_object__for_each_program(prog, obj) {
+		const char *sec = bpf_program__section_name(prog);
+		char *tp;
+
+		if (!sec) {
+			fprintf(stderr, "ERR: failed to get program title\n");
+			goto err;
+		}
+
+		tp = strrchr(sec, '/');
+		if (!tp) {
+			fprintf(stderr, "ERR: wrong program title %s\n", sec);
+			goto err;
+		}
+
+		tp++;
+
+		if (verbose)
+			printf("Attach tracepoint %s \t(prog sec:%s)\n", tp, sec);
+
+		tp_link = bpf_program__attach_tracepoint(prog, "xdp", tp);
+
+		err = libbpf_get_error(tp_link);
+		if (err < 0) {
+			fprintf(stderr, "ERR: failed to open raw tracepoint for %s, (%d %s)\n",
+				tp, -errno, strerror(errno));
+			goto err;
+		}
+	}
+
 	return obj;
 
 err:
@@ -227,13 +831,9 @@ err:
 
 int main(int argc, char **argv)
 {
-	struct bpf_map_info map_expect = { 0 };
-	struct bpf_map_info info = { 0 };
 	struct bpf_object *bpf_obj;
 	struct config cfg;
-	int stats_map_fd;
 	int interval = 2;
-	int err;
 
 	/* Set default BPF-ELF object file and BPF program name */
 	strncpy(cfg.filename, default_filename, sizeof(cfg.filename));
@@ -249,27 +849,9 @@ int main(int argc, char **argv)
 		printf("Success: Loaded BPF-object(%s)\n", cfg.filename);
 	}
 
-	stats_map_fd = find_map_fd(bpf_obj, "xdp_stats_map");
-	if (stats_map_fd < 0)
+	if (check_maps(bpf_obj))
 		return EXIT_FAIL_BPF;
 
-	map_expect.key_size    = sizeof(__s32);
-	map_expect.value_size  = sizeof(__u64);
-
-	err = __check_map_fd_info(stats_map_fd, &info, &map_expect);
-	if (err) {
-		fprintf(stderr, "ERR: map via FD not compatible\n");
-		return err;
-	}
-	if (verbose) {
-		printf("\nCollecting stats from BPF map\n");
-		printf(" - BPF map (bpf_map_type:%d) id:%d name:%s"
-		       " key_size:%d value_size:%d max_entries:%d\n",
-		       info.type, info.id, info.name,
-		       info.key_size, info.value_size, info.max_entries
-		       );
-	}
-
-	stats_poll(stats_map_fd, info.type, interval);
+	stats_poll(bpf_obj, interval, false);
 	return EXIT_OK;
 }
