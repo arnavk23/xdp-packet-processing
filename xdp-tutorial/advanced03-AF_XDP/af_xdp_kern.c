@@ -3,8 +3,14 @@
 #include <linux/bpf.h>
 
 #include <bpf/bpf_helpers.h>
+#ifndef bpf_htons
+#define bpf_htons(x) __builtin_bswap16(x)
+#endif
+#ifndef bpf_ntohs
+#define bpf_ntohs(x) __builtin_bswap16(x)
+#endif
 
-#include "xdp-tutorial/common/parsing_helpers.h"
+#include "../common/parsing_helpers.h"
 
 #define IPPROTO_UDP 17
 
@@ -22,7 +28,7 @@ struct {
 	__uint(max_entries, 64);
 } xdp_stats_map SEC(".maps");
 
-SEC("xdp")
+SEC("xdp_sock_prog")
 int xdp_sock_prog(struct xdp_md *ctx)
 {
 	int index = ctx->rx_queue_index;
@@ -31,7 +37,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	struct ethhdr *eth;
 	struct iphdr *iph = NULL;
 	struct udphdr *udph = NULL;
-	int nh_type, udp_payload_len;
+	int nh_type;
 	void *data_end = (void *)(long)ctx->data_end;
 
 	nh.pos = (void *)(long)ctx->data;
@@ -42,8 +48,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	if (parse_iphdr(&nh, data_end, &iph) != IPPROTO_UDP)
 		return XDP_PASS;
 
-	udp_payload_len = parse_udphdr(&nh, data_end, &udph);
-	if (!udph)
+	if (parse_udphdr(&nh, data_end, &udph) < 0 || !udph)
 		return XDP_PASS;
 
 	// Match UDP dst port 4242

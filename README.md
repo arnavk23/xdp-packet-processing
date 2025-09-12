@@ -115,6 +115,80 @@ sudo bpftool map dump name xsks_map
 - The setup is fully reproducible with provided commands and scripts.
 - The modular design allows for easy extension to more complex user-space logic.
 
+## Step-by-Step Kernel-Level Observations
+
+### 1. Veth/Netns Setup
+
+```bash
+# List network namespaces
+ip netns list
+
+# Show veth interfaces and their status
+ip link show
+
+# Show IP addresses in each namespace
+ip netns exec ns1 ip addr show
+ip netns exec ns2 ip addr show
+```
+
+### 2. XDP Program Attachment
+
+```bash
+# Show XDP status on veth0
+ip netns exec ns1 ip link show veth0
+
+# List loaded BPF programs
+bpftool prog show
+
+# List BPF maps
+bpftool map show
+```
+
+### 3. AF_XDP Socket Setup
+
+```bash
+# Dump XSKMAP to see socket FDs
+bpftool map dump name xsks_map
+```
+
+### 4. Traffic Generation & Kernel Observation
+
+```bash
+# Observe packets at kernel level
+ip netns exec ns1 tcpdump -i veth0 udp port 4242 -vv -c 5
+ip netns exec ns2 tcpdump -i veth1 udp port 4242 -vv -c 5
+
+# Show RX/TX stats for veth interfaces
+ip -s link show veth0
+ip -s link show veth1
+
+# Show driver statistics (if supported)
+ethtool -S veth0
+ethtool -S veth1
+```
+
+### 5. Forwarding & XDP Debugging
+
+```bash
+# Show BPF program trace logs (if enabled)
+bpftool prog tracelog
+
+# Show kernel messages (may include XDP debug prints)
+dmesg | tail
+```
+
+### 6. Map and Program Status
+
+```bash
+# Show XDP program status on interface
+bpftool net show
+
+# Show all BPF objects
+bpftool object show
+```
+
+These commands allow you to observe every step of the AF_XDP pipeline directly in the kernel, confirming setup, program attachment, socket mapping, packet flow, and performance.
+
 ## OVS Integration & Performance Tuning Notes
 
 ### Using OVS with AF_XDP Port (Userspace Datapath)
