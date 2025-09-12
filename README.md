@@ -81,7 +81,7 @@ sudo bpftool map show | grep xsks_map
 sudo bpftool map dump name xsks_map
 ```
 
-### Example Results
+### Results
 
 - **bpftool XSKMAP output:**
   ```
@@ -195,7 +195,7 @@ These commands allow you to observe every step of the AF_XDP pipeline directly i
 
 Open vSwitch (OVS) can be configured to use AF_XDP ports for high-performance userspace packet processing. This allows you to connect AF_XDP sockets to OVS bridges and leverage OVS features (switching, filtering, etc.) with kernel bypass.
 
-#### Example OVS Setup
+#### OVS Setup
 
 ```bash
 # Install OVS (if not already installed)
