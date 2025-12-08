@@ -1,0 +1,58 @@
+# LaTeX
+*.aux
+*.out
+*.log
+*.toc
+*.lot
+*.lof
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.out
+vmlinux.h
+
+# BPF
+*.bpf.o
+*.bpf.skel.h
+.vmlinux.h
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Binaries
+*.bin
+test_rte

@@ -12,6 +12,7 @@ Requirements: bcc (python3-bcc)
 """
 
 from bcc import BPF
+import signal
 import argparse
 import time
 import sys
@@ -105,13 +106,23 @@ def parse_args():
     p.add_argument('--interval', '-i', type=int, default=1, help='Print interval in seconds')
     p.add_argument('--sample-rate', '-s', type=int, default=0, help='Low-rate sampling: 1 in N calls to sample packet headers (experimental)')
     p.add_argument('--try-shared', dest='try_shared', action='store_true', help='If symbol not in binary, try shared libs linked by the binary')
-    p.add_argument('--timeout', type=int, default=10, help='Seconds to wait for first observation before warning')
+    p.add_argument('--timeout', type=int, default=10, help='Seconds to wait for first observation before warning and exit if none are seen')
+    p.add_argument('--duration', type=int, default=0, help='Total seconds to run the probe; 0 means run indefinitely')
     p.add_argument('--log-csv', dest='log_csv', help='Path to append timestamped CSV lines: iso_timestamp,pid,total')
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    stop_requested = False
+
+    def _signal_handler(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     bpf_text = make_bpf_text(args.sample_rate)
     b = BPF(text=bpf_text)
@@ -166,6 +177,7 @@ def main():
     print(f"Attached probes for {args.function}. Printing totals every {args.interval}s. Ctrl-C to quit.")
     try:
         waited = 0
+        elapsed = 0
         csvf = None
         if args.log_csv:
             try:
@@ -199,8 +211,16 @@ def main():
                         pass
             except Exception:
                 samplesf = None
+        # Main polling loop. Supports a total run duration and will exit cleanly on signals.
         while True:
+            if stop_requested:
+                print("Stop requested via signal; detaching and exiting")
+                break
             time.sleep(args.interval)
+            elapsed += args.interval
+            if args.duration and args.duration > 0 and elapsed >= args.duration:
+                print(f"Reached total duration {args.duration}s; detaching and exiting")
+                break
             totals = defaultdict(int)
             for k, v in counts.items():
                 pid = k.value
@@ -210,11 +230,12 @@ def main():
                 if waited < args.timeout:
                     waited += args.interval
                     print("No observations yet.")
+                    # continue waiting until timeout or first observation
                     continue
                 else:
-                    print("Warning: no observations after timeout. Either traffic is not reaching the probed function or the symbol doesn't match.")
-                    waited = args.timeout
-                    continue
+                    print("Warning: no observations after timeout. Either traffic is not reaching the probed function or the symbol doesn't match. Exiting.")
+                    # Exit if we've waited long enough and still have no data
+                    break
 
             ts = datetime.utcnow().isoformat() + 'Z'
             print("--- telemetry (pid -> total packets) ---")
