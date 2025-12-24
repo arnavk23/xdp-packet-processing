@@ -1,0 +1,23 @@
+# BCC/eBPF development Dockerfile (Ubuntu 22.04 LTS)
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    bison build-essential cmake flex git libedit-dev \
+    llvm-14-dev libclang-14-dev python3 python3-pip python3-setuptools \
+    bpfcc-tools python3-bpfcc linux-headers-generic iproute2 iputils-ping \
+    libelf-dev zlib1g-dev libfl-dev curl sudo vim && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Set up a user for development
+RUN useradd -ms /bin/bash dev && echo "dev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+USER dev
+WORKDIR /home/dev
+
+# Copy your ebpf-poc folder into the container
+COPY . /home/dev/ebpf-poc
+WORKDIR /home/dev/ebpf-poc
+
+CMD ["/bin/bash"]
